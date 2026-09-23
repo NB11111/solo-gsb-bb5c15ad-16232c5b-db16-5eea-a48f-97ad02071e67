@@ -4,6 +4,7 @@
     POST /paths                  写入 SVG path 数据及填充规则
     POST /paths/{id}/normalize   按轮廓包含层级分类外环/孔洞并重写方向
     POST /paths/{id}/clearance   轮廓间安全间隙（最小欧氏距离）即时校验
+    POST /paths/{id}/metrics     填充总面积与面积质心只读分析
     POST /paths/compare          两条已存路径的版本差异审计（指纹匹配 + 三类变更）
     GET  /paths/{id}             查询原始路径、规范化结果及边界警告
     GET  /healthz                存活/就绪探针
@@ -25,6 +26,7 @@ from sqlite3 import Connection
 from . import db
 from .clearance import check_clearance
 from .diff import compare_normalized
+from .metrics import compute_metrics
 from .svggeo import SVGPathError, analyze_contours, normalize_path
 
 
@@ -36,9 +38,10 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="SVG 轮廓规范化 API",
-    version="1.2.0",
+    version="1.3.0",
     description="写入 SVG path，按包含层级分类外环/孔洞并重写绕向，"
-                "支持轮廓间安全间隙校验与两条已存路径的版本差异审计。",
+                "支持轮廓间安全间隙校验、填充总面积/面积质心只读分析"
+                "与两条已存路径的版本差异审计。",
     lifespan=lifespan,
 )
 
@@ -269,4 +272,20 @@ def clearance(path_id: int,
     result = check_clearance(contours,
                              min_distance=payload.min_distance,
                              include_open=payload.include_open)
+    return {"id": path_id, **result}
+
+
+@app.post("/paths/{path_id}/metrics")
+def metrics(path_id: int,
+            conn: Connection = Depends(get_db)) -> dict[str, Any]:
+    row = _get_row(conn, path_id)
+
+    # 即时解析/分类后计算面积与质心：不依赖已保存的规范化结果，也不写库
+    try:
+        contours, _warnings = _analyze_row(row)
+    except SVGPathError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"SVG path 无法解析: {exc}")
+
+    result = compute_metrics(contours)
     return {"id": path_id, **result}

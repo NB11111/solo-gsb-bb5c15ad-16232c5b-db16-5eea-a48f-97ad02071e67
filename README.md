@@ -4,7 +4,10 @@
 按轮廓之间的**包含层级**把每个子路径分类为**外环 / 孔洞（可嵌套出“岛”）**，
 并重写绘制方向（外环顺时针、孔洞逆时针），同时保留轮廓层级、原始索引与自定义元数据，
 对边界情况给出明确警告；另提供 **`POST /paths/{id}/clearance` 轮廓间安全间隙校验**
-（按细分线段计算任意两轮廓边界的最小欧氏距离）与 **`POST /paths/compare` 版本差异审计**，
+（按细分线段计算任意两轮廓边界的最小欧氏距离）、
+**`POST /paths/{id}/metrics` 填充总面积与面积质心只读分析**（按包含层级
+交替计入外环/孔洞/岛，曲线按现有细分多边形近似）与
+**`POST /paths/compare` 版本差异审计**，
 按几何指纹稳定匹配两条已存路径并给出 added / removed / modified 三组差异。启动后自动建表，
 可直接调用。
 
@@ -18,8 +21,9 @@
 │   ├── db.py          # SQLite 连接与幂等建表
 │   ├── svggeo.py      # SVG path 解析 / 细分 / 包含层级 / 方向重写 / 几何指纹 / 线段距离（零三方依赖）
 │   ├── clearance.py   # 轮廓间安全间隙校验：逐段最小欧氏距离、孔-直接 parent 标记
+│   ├── metrics.py     # 填充总面积与面积质心：层级交替计入、一阶矩加权质心
 │   └── diff.py        # 版本差异审计：指纹+索引稳定匹配、三类 modified 分类
-├── tests/             # pytest 单元 + API 端到端测试（77 个）
+├── tests/             # pytest 单元 + API 端到端测试（100 个）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -186,6 +190,62 @@ curl -s -X POST localhost:8000/paths/1/clearance \
 # -> conflict_count=1，b.role="open"，distance=1.0，hole_parent=false
 ```
 
+### `POST /paths/{id}/metrics` — 填充总面积与面积质心（只读）
+
+对已存路径**即时解析并完成包含层级分类**（只读：无需事先调用 normalize，
+不写规范化状态、不写库），按**包含层级交替计入**实际填充区域：
+
+- 外环（`outer`，深度偶数：0、2、4…，深度 2 即“孔中岛”）**加**；
+- 孔洞（`hole`，深度奇数：1、3、5…）**减**；
+- 开放轮廓（未以 `Z` 闭合）与退化轮廓（面积为 0 或顶点不足）**不参与**。
+
+面积按**现有曲线细分**（贝塞尔/椭圆弧展开为折线，与 normalize/clearance
+完全一致的细分口径）后的多边形用鞋带公式近似；每个环的质心由多边形
+一阶矩求出（该公式对顺/逆时针方向不敏感），总质心是各环**按计入面积
+加权**的加权平均（孔洞以负权重参与）。**无有效闭合区域**（路径为空、
+全部是开放/退化轮廓，或总面积被孔/岛抵消）时返回 `"area": 0`、
+`"centroid": null`。
+
+请求无需请求体（附带任意 JSON 体会被忽略）。
+
+```bash
+# 外环 0..10（面积100）- 孔 2..8（面积36）+ 岛 4..6（面积4）= 68
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0h10v10h-10Z M2,2h6v6h-6Z M4,4h2v2h-2Z"
+}'
+curl -s -X POST localhost:8000/paths/1/metrics
+```
+
+响应：
+
+```json
+{
+  "id": 1,
+  "area": 68.0,
+  "centroid": {"x": 5.0, "y": 5.0},
+  "contributing_contour_count": 3,
+  "contours": [
+    {"original_index": 0, "role": "outer", "depth": 0,
+     "area": 100.0, "centroid": {"x": 5.0, "y": 5.0}},
+    {"original_index": 1, "role": "hole", "depth": 1,
+     "area": 36.0, "centroid": {"x": 5.0, "y": 5.0}},
+    {"original_index": 2, "role": "outer", "depth": 2,
+     "area": 4.0, "centroid": {"x": 5.0, "y": 5.0}}
+  ],
+  "excluded_contours": []
+}
+```
+
+- `area`：填充总面积（外环之和减去孔洞之和，恒非负；无有效区域为 `0`）；
+- `centroid`：面积质心 `{x, y}`（SVG 屏幕坐标系）；无有效区域时为 `null`；
+- `contours[]`：每个参与环（仅 `outer`/`hole`）按 `original_index` 升序给出
+  `role`、`depth`、该环**无符号** `area` 与该环自身的 `centroid`，便于审计
+  加/减明细；`excluded_contours[]` 列出被跳过的开放/退化轮廓及 `reason`
+  （`open` / `degenerate`）。
+
+只读保证：响应不依赖且不修改已保存的规范化结果，重复调用结果一致。
+路径不存在返回 `404`；已存路径无法解析返回 `422`。
+
 ### `GET /paths/{id}` — 查询原始路径、规范化结果与警告
 
 未规范化时 `normalized` 为 `null`；已规范化时包含 `d`、`contours`、
@@ -331,7 +391,7 @@ SVG 规范的端点参数化算法。
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 77 passed
+pytest -q          # 100 passed
 ```
 
 覆盖：解析器边界、面积符号、外/孔/岛三层嵌套、同级双孔、曲线与弧反转几何等价性、
@@ -342,7 +402,10 @@ added/removed、元数据透传、未规范化即时审计与脏数据 422；
 安全间隙的点/线段距离原语（相交、零长度段）、孔-直接 parent 标记、
 同级孔与隔层 island 不标记、**距离等于阈值通过**、开放轮廓默认跳过与
 `include_open` 纳入、退化轮廓始终跳过、曲线细分、包围盒剔除、结果确定性与
-只读不落库、404/非法参数 422 等。
+只读不落库、404/非法参数 422 等；
+填充指标的外-孔-岛交替面积、面积加权质心（偏置孔使质心移位）、方向无关性、
+两种填充规则一致、开放/退化轮廓排除、空路径与无有效区域返回 0/null、
+圆弧/贝塞尔细分近似、多外环合并、只读不落库与 404/脏数据 422。
 
 ## 数据存储
 

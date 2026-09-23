@@ -411,3 +411,115 @@ def test_clearance_422_on_unparseable_stored_path(client):
         bad_id = cur.lastrowid
     r = client.post(f"/paths/{bad_id}/clearance", json={"min_distance": 1})
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /paths/{id}/metrics 填充总面积与面积质心
+# ---------------------------------------------------------------------------
+
+def test_metrics_outer_hole_island_alternation(client):
+    # 外环 0..10（100）- 孔 2..8（36）+ 岛 4..6（4）= 68
+    pid = _mk(client, "M0,0h10v10h-10Z M2,2h6v6h-6Z M4,4h2v2h-2Z")
+    r = client.post(f"/paths/{pid}/metrics")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["id"] == pid
+    assert body["area"] == 68.0
+    assert body["centroid"] == {"x": 5.0, "y": 5.0}
+    assert body["contributing_contour_count"] == 3
+    assert [(c["original_index"], c["role"], c["depth"])
+            for c in body["contours"]] == [
+        (0, "outer", 0), (1, "hole", 1), (2, "outer", 2)]
+    # 各环质心独立给出
+    assert body["contours"][1]["centroid"] == {"x": 5.0, "y": 5.0}
+    assert body["contours"][1]["area"] == 36.0
+    assert body["excluded_contours"] == []
+
+
+def test_metrics_off_center_hole_weighted_centroid(client):
+    pid = _mk(client, "M0,0h10v10h-10Z M0,0h4v4h-4Z")
+    body = client.post(f"/paths/{pid}/metrics").json()
+    assert body["area"] == 84.0
+    # (100*(5,5) - 16*(2,2)) / 84
+    assert abs(body["centroid"]["x"] - (500 - 32) / 84) < 1e-9
+    assert abs(body["centroid"]["y"] - (500 - 32) / 84) < 1e-9
+
+
+def test_metrics_original_winding_irrelevant(client):
+    # 外环逆时针、孔顺时针：只看包含层级，结果不变
+    pid = _mk(client, "M0,10h10v-10h-10Z M3,7h4v-4h-4Z")
+    body = client.post(f"/paths/{pid}/metrics").json()
+    assert body["area"] == 84.0
+    assert body["centroid"] == {"x": 5.0, "y": 5.0}
+
+
+def test_metrics_excludes_open_and_degenerate(client):
+    d = "M0,0h10v10h-10Z M20,0 L30,5 L20,10 M2,2 L8,2 L2,2 Z"
+    pid = _mk(client, d)
+    body = client.post(f"/paths/{pid}/metrics").json()
+    assert body["area"] == 100.0
+    assert body["centroid"] == {"x": 5.0, "y": 5.0}
+    assert body["contributing_contour_count"] == 1
+    assert {(e["original_index"], e["reason"])
+            for e in body["excluded_contours"]} == {
+        (1, "open"), (2, "degenerate")}
+
+
+def test_metrics_no_valid_region_returns_zero_and_null(client):
+    # 仅开放折线 + 退化环
+    pid = _mk(client, "M0,0 L10,0 L5,3 M5,5 L6,5 L5,5 Z")
+    body = client.post(f"/paths/{pid}/metrics").json()
+    assert body["area"] == 0
+    assert body["centroid"] is None
+    assert body["contributing_contour_count"] == 0
+    assert body["contours"] == []
+
+    # 空路径同样 0 / null
+    pid_empty = _mk(client, "")
+    body = client.post(f"/paths/{pid_empty}/metrics").json()
+    assert body == {
+        "id": pid_empty, "area": 0, "centroid": None,
+        "contributing_contour_count": 0,
+        "contours": [], "excluded_contours": []}
+
+
+def test_metrics_is_readonly_and_needs_no_prior_normalization(client):
+    pid = _mk(client, "M0,0h10v10h-10Z M3,3h4v4h-4Z")
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    assert client.post(f"/paths/{pid}/metrics").status_code == 200
+    # 即时分析不写规范化状态、不写库
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+
+
+def test_metrics_deterministic_across_calls(client):
+    pid = _mk(client, "M0,0h10v10h-10Z M2,2h6v6h-6Z M4,4h2v2h-2Z")
+    bodies = [client.post(f"/paths/{pid}/metrics").json() for _ in range(3)]
+    assert bodies[0] == bodies[1] == bodies[2]
+
+
+def test_metrics_404(client):
+    r = client.post("/paths/999999/metrics")
+    assert r.status_code == 404
+    assert "999999" in r.json()["detail"]
+
+
+def test_metrics_422_on_unparseable_stored_path(client):
+    # 写入时会拦截坏数据，这里直接落库历史脏数据 -> 422
+    from app import db
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO paths (d, fill_rule, metadata, contour_metadata) "
+            "VALUES (?, 'nonzero', '{}', '[]')",
+            ("M0,0 L",))
+        bad_id = cur.lastrowid
+    r = client.post(f"/paths/{bad_id}/metrics")
+    assert r.status_code == 422
+    assert "无法解析" in r.json()["detail"]
+
+
+def test_metrics_ignores_request_body(client):
+    # 只读端点：不接收参数；附带请求体不影响结果
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    r = client.post(f"/paths/{pid}/metrics", json={"foo": "bar"})
+    assert r.status_code == 200
+    assert r.json()["area"] == 100.0
