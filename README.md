@@ -3,7 +3,9 @@
 基于 **FastAPI + SQLite + Docker** 的服务：接收 SVG `path` 数据与填充规则，
 按轮廓之间的**包含层级**把每个子路径分类为**外环 / 孔洞（可嵌套出“岛”）**，
 并重写绘制方向（外环顺时针、孔洞逆时针），同时保留轮廓层级、原始索引与自定义元数据，
-对边界情况给出明确警告；另提供 **`POST /paths/{id}/clearance` 轮廓间安全间隙校验**
+对边界情况给出明确警告；另提供 **`POST /paths/{id}/metrics` 填充面积与面积质心分析**
+（按外环/孔洞/岛交替计入，曲线经细分多边形近似，只读不写库）、
+**`POST /paths/{id}/clearance` 轮廓间安全间隙校验**
 （按细分线段计算任意两轮廓边界的最小欧氏距离）与 **`POST /paths/compare` 版本差异审计**，
 按几何指纹稳定匹配两条已存路径并给出 added / removed / modified 三组差异。启动后自动建表，
 可直接调用。
@@ -17,9 +19,10 @@
 │   ├── main.py        # FastAPI 路由、模型、启动自动初始化
 │   ├── db.py          # SQLite 连接与幂等建表
 │   ├── svggeo.py      # SVG path 解析 / 细分 / 包含层级 / 方向重写 / 几何指纹 / 线段距离（零三方依赖）
+│   ├── metrics.py     # 填充面积与面积质心：外/孔/岛交替计入，基于细分多边形
 │   ├── clearance.py   # 轮廓间安全间隙校验：逐段最小欧氏距离、孔-直接 parent 标记
 │   └── diff.py        # 版本差异审计：指纹+索引稳定匹配、三类 modified 分类
-├── tests/             # pytest 单元 + API 端到端测试（77 个）
+├── tests/             # pytest 单元 + API 端到端测试（104 个）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -114,6 +117,65 @@ curl -s -X POST localhost:8000/paths/1/normalize
 | `bounds` | `minx/miny/maxx/maxy` 包围盒 |
 | `reversed` | 本次是否重写了方向 |
 | `metadata` | 创建时按索引提交的自定义元数据 |
+
+### `POST /paths/{id}/metrics` — 填充总面积与面积质心（只读分析）
+
+对已存路径**即时解析**并完成轮廓包含层级分类（无需事先调用 normalize，
+**不写规范化状态、不写数据库**），再按**包含层级交替**统计填充区域：
+
+- 外环 `outer`（深度 0、2、4 …）面积 **+** 计入；
+- 孔洞 `hole`（深度 1、3、5 …）面积 **−** 扣减；
+- 孔中的“岛”（深度 2）重新计入，岛中孔（深度 3）继续扣减，依此类推；
+- **开放轮廓**（未以 `Z` 闭合）与**退化轮廓**（面积为 0 或顶点不足）不参与。
+
+面积在曲线（贝塞尔/椭圆弧）**细分后的多边形**上按鞋带公式近似，与
+normalize / clearance 使用同一份细分折线；质心为各环带符号面积矩加权的
+几何质心（SVG 屏幕坐标，y 轴向下），与轮廓书写方向无关。无请求体。
+
+```bash
+# 外方 0..10 含内孔 2..8：填充面积 100 - 36 = 64
+curl -s -X POST localhost:8000/paths/1/metrics
+```
+
+响应：
+
+```json
+{
+  "id": 1,
+  "fill_rule": "nonzero",
+  "area": 64.0,
+  "centroid": {"x": 5.0, "y": 5.0},
+  "contributing_contour_count": 2,
+  "contours": [
+    {"original_index": 0, "role": "outer", "depth": 0,
+     "area": 100.0, "signed_contribution": 100.0,
+     "centroid": {"x": 5.0, "y": 5.0}},
+    {"original_index": 1, "role": "hole", "depth": 1,
+     "area": 36.0, "signed_contribution": -36.0,
+     "centroid": {"x": 5.0, "y": 5.0}}
+  ],
+  "skipped_contours": []
+}
+```
+
+- `area`：填充总面积（外环/岛为正贡献、孔洞为负贡献后的净面积，恒 ≥ 0）；
+- `centroid`：`{"x", "y"}` 面积质心；**没有任何有效闭合区域**（空路径、
+  仅开放/退化轮廓，或净面积被孔洞完全抵消）时为 `null`，同时 `area` 为 `0.0`；
+- `contours[]`：逐环明细（几何面积、对总面积的带符号贡献、单环质心），
+  按 `original_index` 升序；
+- `skipped_contours[]`：未参与统计的轮廓及 `reason`（`open` / `degenerate`）。
+
+孔中岛示例（`100 − 64 + 4 = 40`，质心偏向位于 `(7,7)` 的小岛）：
+
+```bash
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0h10v10h-10Z M1,1h8v8h-8Z M6,6h2v2h-2Z"
+}'
+curl -s -X POST localhost:8000/paths/1/metrics
+# -> {"id":1, "area":40.0, "centroid":{"x":5.2,"y":5.2}, ...}
+```
+
+路径不存在返回 `404`；已存路径无法解析（历史脏数据）返回 `422`。
 
 ### `POST /paths/{id}/clearance` — 轮廓间安全间隙校验
 
@@ -331,7 +393,7 @@ SVG 规范的端点参数化算法。
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 77 passed
+pytest -q          # 104 passed
 ```
 
 覆盖：解析器边界、面积符号、外/孔/岛三层嵌套、同级双孔、曲线与弧反转几何等价性、
@@ -339,6 +401,9 @@ pytest -q          # 77 passed
 几何指纹的起点/方向不变性、闭合区分、量化噪声吸收；版本审计的仅方向变化、
 层级变化、几何变化、子路径重排（同指纹索引变化）、全等重复轮廓就近配对、
 added/removed、元数据透传、未规范化即时审计与脏数据 422；
+填充面积/质心的单环、外-孔、外-孔-岛、四层交替、书写方向无关、
+两种填充规则一致、曲线细分近似、开放与退化排除、空路径返回面积 0 与质心 null、
+只读不落库、404/脏数据 422；
 安全间隙的点/线段距离原语（相交、零长度段）、孔-直接 parent 标记、
 同级孔与隔层 island 不标记、**距离等于阈值通过**、开放轮廓默认跳过与
 `include_open` 纳入、退化轮廓始终跳过、曲线细分、包围盒剔除、结果确定性与

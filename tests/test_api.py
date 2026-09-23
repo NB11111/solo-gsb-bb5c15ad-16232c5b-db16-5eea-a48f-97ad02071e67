@@ -411,3 +411,114 @@ def test_clearance_422_on_unparseable_stored_path(client):
         bad_id = cur.lastrowid
     r = client.post(f"/paths/{bad_id}/clearance", json={"min_distance": 1})
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /paths/{id}/metrics 填充面积与面积质心（只读）
+# ---------------------------------------------------------------------------
+
+def test_metrics_simple_outer(client):
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    r = client.post(f"/paths/{pid}/metrics")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["id"] == pid
+    assert body["fill_rule"] == "nonzero"
+    assert body["area"] == 100.0
+    assert body["centroid"] == {"x": 5.0, "y": 5.0}
+    assert body["contributing_contour_count"] == 1
+    assert body["contours"][0]["role"] == "outer"
+    assert body["skipped_contours"] == []
+
+
+def test_metrics_outer_hole_island(client):
+    # 100 - 64 + 4 = 40；质心偏向 (7,7) 的岛 -> 5.2
+    pid = _mk(client,
+              "M0,0h10v10h-10Z M1,1h8v8h-8Z M6,6h2v2h-2Z")
+    body = client.post(f"/paths/{pid}/metrics").json()
+    assert body["area"] == 40.0
+    assert abs(body["centroid"]["x"] - 5.2) < 1e-9
+    assert abs(body["centroid"]["y"] - 5.2) < 1e-9
+    assert body["contributing_contour_count"] == 3
+    assert [c["role"] for c in body["contours"]] == ["outer", "hole", "outer"]
+    assert [c["depth"] for c in body["contours"]] == [0, 1, 2]
+
+
+def test_metrics_orientation_independent(client):
+    # 外环逆时针书写，面积仍为正
+    pid = _mk(client, "M0,0 L0,10 L10,10 L10,0 Z")
+    body = client.post(f"/paths/{pid}/metrics").json()
+    assert body["area"] == 100.0
+    assert body["centroid"] == {"x": 5.0, "y": 5.0}
+
+
+def test_metrics_skips_open_and_degenerate(client):
+    d = "M0,0h10v10h-10Z M5,5 L8,5 L5,5 Z M20,0 L30,0 L30,10"
+    pid = _mk(client, d)
+    body = client.post(f"/paths/{pid}/metrics").json()
+    assert body["area"] == 100.0
+    assert body["contributing_contour_count"] == 1
+    reasons = {(s["original_index"], s["reason"])
+               for s in body["skipped_contours"]}
+    assert reasons == {(1, "degenerate"), (2, "open")}
+
+
+def test_metrics_empty_path_area_zero_centroid_null(client):
+    pid = _mk(client, "")
+    body = client.post(f"/paths/{pid}/metrics").json()
+    assert body["area"] == 0.0
+    assert body["centroid"] is None
+    assert body["contributing_contour_count"] == 0
+
+
+def test_metrics_only_open_area_zero_centroid_null(client):
+    pid = _mk(client, "M0,0 L10,0 L10,10")
+    body = client.post(f"/paths/{pid}/metrics").json()
+    assert body["area"] == 0.0
+    assert body["centroid"] is None
+    assert body["skipped_contours"][0]["reason"] == "open"
+
+
+def test_metrics_curve_flattened_area(client):
+    # 细分多边形近似：单位圆面积在 (3, π) 之间，质心为原点
+    import math
+    pid = _mk(client, "M-1,0 A1,1 0 1,0 1,0 A1,1 0 1,0 -1,0 Z")
+    body = client.post(f"/paths/{pid}/metrics").json()
+    assert 3.0 < body["area"] < math.pi
+    assert abs(body["centroid"]["x"]) < 1e-9
+    assert abs(body["centroid"]["y"]) < 1e-9
+
+
+def test_metrics_is_readonly_and_needs_no_prior_normalization(client):
+    pid = _mk(client, "M0,0h10v10h-10Z M2,2h6v6h-6Z")
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    assert client.post(f"/paths/{pid}/metrics").status_code == 200
+    # 只读：不产生规范化结果，重复调用一致
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    b1 = client.post(f"/paths/{pid}/metrics").json()
+    b2 = client.post(f"/paths/{pid}/metrics").json()
+    assert b1 == b2
+
+
+def test_metrics_404(client):
+    r = client.post("/paths/999999/metrics")
+    assert r.status_code == 404
+
+
+def test_metrics_422_on_unparseable_stored_path(client):
+    from app import db
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO paths (d, fill_rule, metadata, contour_metadata) "
+            "VALUES (?, 'nonzero', '{}', '[]')",
+            ("M0,0 L",))
+        bad_id = cur.lastrowid
+    r = client.post(f"/paths/{bad_id}/metrics")
+    assert r.status_code == 422
+    assert "无法解析" in r.json()["detail"]
+
+
+def test_metrics_id_path_validation(client):
+    # 非整数 id 走 FastAPI 422；数字 0 是合法 int，查无此路径 -> 404
+    assert client.post("/paths/x/metrics").status_code == 422
+    assert client.post("/paths/0/metrics").status_code == 404
